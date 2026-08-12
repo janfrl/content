@@ -66,7 +66,10 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
   let db: Awaited<ReturnType<typeof getLocalDatabase>>
   async function getDb() {
     if (!db) {
-      db = await getLocalDatabase(options._localDatabase!, { nativeSqlite: options.experimental?.nativeSqlite })
+      db = await getLocalDatabase(options._localDatabase!, {
+        nativeSqlite: options.experimental?.nativeSqlite,
+        sqliteConnector: options.experimental?.sqliteConnector,
+      })
     }
     return db
   }
@@ -105,9 +108,16 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
     },
   })
 
-  watcher.on('add', onChange)
-  watcher.on('change', onChange)
-  watcher.on('unlink', onRemove)
+  let updateQueue = Promise.resolve()
+  const enqueue = (handler: (pathOrError: string | Error) => Promise<void>, pathOrError: string | Error) => {
+    updateQueue = updateQueue
+      .then(() => handler(pathOrError))
+      .catch(error => logger.error(error))
+  }
+
+  watcher.on('add', pathOrError => enqueue(onChange, pathOrError))
+  watcher.on('change', pathOrError => enqueue(onChange, pathOrError))
+  watcher.on('unlink', pathOrError => enqueue(onRemove, pathOrError))
 
   async function onChange(pathOrError: string | Error) {
     if (pathOrError instanceof Error) {
@@ -164,7 +174,7 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
             collectionType: collection.type,
           }).then(result => JSON.stringify(result))
 
-          db.insertDevelopmentCache(keyInCollection, checksum, parsedContent)
+          await db.insertDevelopmentCache(keyInCollection, checksum, parsedContent)
         }
 
         const insert = generateCollectionInsert(collection, JSON.parse(parsedContent))
@@ -207,9 +217,30 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
   async function broadcast(collection: ResolvedCollection, key: string, insert?: ReturnType<typeof generateCollectionInsert>) {
     const db = await getDb()
     const removeQuery = `DELETE FROM ${collection.tableName} WHERE id = '${key.replace(/'/g, '\'\'')}';`
-    await db.exec(removeQuery)
-    if (insert) {
-      await Promise.all(insert.queries.map(query => db.exec(query)))
+    try {
+      if (db.supportsTransactions) {
+        await db.exec('BEGIN TRANSACTION')
+      }
+      await db.exec(removeQuery)
+      if (insert) {
+        for (const query of insert.queries) {
+          await db.exec(query)
+        }
+      }
+      if (db.supportsTransactions) {
+        await db.exec('COMMIT')
+      }
+    }
+    catch (error) {
+      if (db.supportsTransactions) {
+        try {
+          await db.exec('ROLLBACK')
+        }
+        catch {
+          // Ignore rollback errors, original error takes precedence
+        }
+      }
+      throw error
     }
 
     const collectionDump = manifest.dump[collection.name]!
@@ -225,7 +256,7 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
       collectionDump.splice(indexToUpdate, itemsToRemove)
     }
 
-    updateTemplates({
+    await updateTemplates({
       filter: template => [
         moduleTemplates.manifest,
         moduleTemplates.fullCompressedDump,
@@ -233,7 +264,7 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
       ].includes(template.filename),
     })
 
-    contentHooks.callHook('hmr:content:update', {
+    await contentHooks.callHook('hmr:content:update', {
       key,
       collection: collection.name,
       queries: insert ? [removeQuery, ...insert.queries] : [removeQuery],
@@ -243,8 +274,9 @@ export function watchContents(nuxt: Nuxt, options: ModuleOptions, manifest: Mani
   nuxt.hook('close', async () => {
     if (watcher) {
       watcher.removeAllListeners()
-      watcher.close()
-      db?.close()
+      await watcher.close()
+      await updateQueue
+      await db?.close()
     }
   })
 }

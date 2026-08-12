@@ -1,10 +1,10 @@
 import fs from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { afterAll, beforeAll, describe, expect, test } from 'vitest'
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
 import { defineCollection } from '../src/utils'
 import { generateCollectionTableDefinition, resolveCollection } from '../src/utils/collection'
-import { contentHooks, watchContents } from '../src/utils/dev'
+import { contentHooks, getContentChecksum, logger, watchContents } from '../src/utils/dev'
 import { getLocalDatabase } from '../src/utils/database'
 import { initiateValidatorsContext } from '../src/utils/dependencies'
 import type { LocalDevelopmentDatabase } from '../src/module'
@@ -14,14 +14,21 @@ const rootDir = join(tmpdir(), 'nuxt-content-hmr-test-' + Date.now())
 const contentDir = join(rootDir, 'content')
 const dbPath = join(rootDir, 'contents.sqlite')
 
+const closeHooks: Array<() => void | Promise<void>> = []
+let callNuxtHook: (...args: unknown[]) => Promise<void> = () => Promise.resolve()
 const nuxtMock = {
   options: { rootDir, buildDir: join(rootDir, '.nuxt') },
-  callHook: () => Promise.resolve(),
-  hook: (_event: string, _cb: () => void) => {},
+  callHook: (...args: unknown[]) => callNuxtHook(...args),
+  hook: (event: string, cb: () => void | Promise<void>) => {
+    if (event === 'close') {
+      closeHooks.push(cb)
+    }
+  },
 } as never
 
 describe('multi-collection HMR — file matched by multiple collections', () => {
   let db: LocalDevelopmentDatabase
+  let manifest: Manifest
 
   beforeAll(async () => {
     await initiateValidatorsContext()
@@ -32,36 +39,18 @@ describe('multi-collection HMR — file matched by multiple collections', () => 
 
     db = await getLocalDatabase({ type: 'sqlite', filename: dbPath })
 
-    // Pre-create the collection tables so broadcast's DELETE/INSERT can run
-    const tmpContent = resolveCollection('content', defineCollection({ type: 'page', source: '**' }))!
-    const tmpBlog = resolveCollection('blog', defineCollection({ type: 'page', source: 'blog/**' }))!
-    for (const col of [tmpContent, tmpBlog]) {
-      for (const stmt of generateCollectionTableDefinition(col, { drop: true }).split('\n')) {
+    const contentCollection = resolveCollection('content', defineCollection({ type: 'page', source: '**' }))!
+    const blogCollection = resolveCollection('blog', defineCollection({ type: 'page', source: 'blog/**' }))!
+    for (const collection of [contentCollection, blogCollection]) {
+      for (const stmt of generateCollectionTableDefinition(collection, { drop: true }).split('\n')) {
         await db.exec(stmt)
       }
-    }
-  })
-
-  afterAll(async () => {
-    db?.close()
-    await fs.rm(rootDir, { recursive: true, force: true })
-  })
-
-  test('modifying a file that matches multiple collections updates all of them', async () => {
-    // content: ** (catch-all)
-    const contentCollection = resolveCollection('content', defineCollection({ type: 'page', source: '**' }))!
-    // blog: blog/** (subset)
-    const blogCollection = resolveCollection('blog', defineCollection({ type: 'page', source: 'blog/**' }))!
-
-    // Populate source.cwd (normally done by module setup)
-    for (const source of contentCollection.source!) {
-      await source.prepare?.({ rootDir })
-    }
-    for (const source of blogCollection.source!) {
-      await source.prepare?.({ rootDir })
+      for (const source of collection.source!) {
+        await source.prepare?.({ rootDir })
+      }
     }
 
-    const manifest: Manifest = {
+    manifest = {
       collections: [contentCollection, blogCollection],
       dump: { content: [], blog: [] },
       checksum: {},
@@ -74,29 +63,159 @@ describe('multi-collection HMR — file matched by multiple collections', () => 
       experimental: {},
     } as never
 
-    // Start watching — this is the function under test
     watchContents(nuxtMock, options, manifest)
+    await new Promise(resolve => setTimeout(resolve, 100))
+  })
 
-    // Collect which collections received HMR updates
+  afterAll(async () => {
+    await Promise.all(closeHooks.map(hook => hook()))
+    await fs.rm(rootDir, { recursive: true, force: true })
+  })
+
+  test('modifying a file that matches multiple collections updates all of them', async () => {
     const updatedCollections: string[] = []
+    let resolveUpdates: (() => void) | undefined
+    const updatesReceived = new Promise<void>((resolve) => {
+      resolveUpdates = resolve
+    })
     const stopListening = contentHooks.hook('hmr:content:update', ({ collection }) => {
       updatedCollections.push(collection)
+      if (new Set(updatedCollections).size === 2) {
+        resolveUpdates?.()
+      }
     })
 
-    // Modify blog/hello.md — it lives under blog/** AND under ** so both collections match
     const blogPost = join(contentDir, 'blog', 'hello.md')
     const original = await fs.readFile(blogPost, 'utf8')
-    await fs.writeFile(blogPost, original.replace('# Hello', '# Hello Updated'))
+    const updated = original.replace('# Hello', '# Hello Updated')
+    await fs.writeFile(blogPost, updated)
 
-    // Give the watcher time to detect, parse and broadcast (chokidar + async)
-    await new Promise(resolve => setTimeout(resolve, 2000))
+    await Promise.race([
+      updatesReceived,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for HMR updates')), 5000)),
+    ])
 
     stopListening()
-    await fs.writeFile(blogPost, original) // restore
 
     expect(updatedCollections, 'both collections should have been notified').toContain('content')
     expect(updatedCollections, 'both collections should have been notified').toContain('blog')
     expect(manifest.dump.content[0]).toMatch(/; -- [\w-]+$/)
     expect(manifest.dump.blog[0]).toMatch(/; -- [\w-]+$/)
+
+    for (const key of ['content/blog/hello.md', 'blog/blog/hello.md']) {
+      const cacheEntry = await db.fetchDevelopmentCacheForKey(key)
+      expect(cacheEntry?.checksum).toBe(getContentChecksum(updated))
+      expect(JSON.parse(cacheEntry!.value).body.value[0][2]).toBe('Hello Updated')
+    }
+  })
+
+  test('rapid changes to one file are committed in event order', async () => {
+    const page = join(contentDir, 'index.md')
+    const firstContent = '---\ntitle: Home\n---\n# First update\n'
+    const secondContent = '---\ntitle: Home\n---\n# Second update\n'
+
+    let releaseFirstParse: (() => void) | undefined
+    const firstParseReleased = new Promise<void>((resolve) => {
+      releaseFirstParse = resolve
+    })
+    let markFirstParseStarted: (() => void) | undefined
+    const firstParseStarted = new Promise<void>((resolve) => {
+      markFirstParseStarted = resolve
+    })
+
+    callNuxtHook = async (name, context) => {
+      if (name === 'content:file:beforeParse' && (context as { file?: { body?: string } })?.file?.body === firstContent) {
+        markFirstParseStarted?.()
+        await firstParseReleased
+      }
+    }
+
+    let updateCount = 0
+    let resolveUpdates: (() => void) | undefined
+    const updatesReceived = new Promise<void>((resolve) => {
+      resolveUpdates = resolve
+    })
+    const stopListening = contentHooks.hook('hmr:content:update', ({ key }) => {
+      if (key === 'content/index.md' && ++updateCount === 2) {
+        resolveUpdates?.()
+      }
+    })
+
+    await fs.writeFile(page, firstContent)
+    await firstParseStarted
+    await new Promise(resolve => setTimeout(resolve, 100))
+    await fs.writeFile(page, secondContent)
+    await new Promise(resolve => setTimeout(resolve, 200))
+    releaseFirstParse?.()
+
+    await Promise.race([
+      updatesReceived,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for rapid HMR updates')), 5000)),
+    ])
+
+    stopListening()
+    callNuxtHook = () => Promise.resolve()
+
+    const cacheEntry = await db.fetchDevelopmentCacheForKey('content/index.md')
+    expect(cacheEntry?.checksum).toBe(getContentChecksum(secondContent))
+    expect(JSON.parse(cacheEntry!.value).body.value[0][2]).toBe('Second update')
+    expect(manifest.dump.content.some(item => item.includes('Second update'))).toBe(true)
+  })
+
+  test('rolls back a failed update and continues processing later changes', async () => {
+    const page = join(contentDir, 'index.md')
+    const failedContent = '---\ntitle: Home\n---\n# Failed update\n'
+    const recoveredContent = '---\ntitle: Home\n---\n# Recovered update\n'
+    const collection = manifest.collections.find(item => item.name === 'content')!
+    const database = db.database!
+    const originalExec = database.exec.bind(database)
+    const logError = vi.spyOn(logger, 'error').mockImplementation(() => {})
+    const before = await database.prepare(`SELECT * FROM ${collection.tableName} WHERE id = ?`)
+      .get('content/index.md')
+    let rejectNextInsert = true
+
+    database.exec = async (sql: string) => {
+      if (rejectNextInsert && sql.startsWith(`INSERT INTO ${collection.tableName}`)) {
+        rejectNextInsert = false
+        throw new Error('Simulated insert failure')
+      }
+      return await originalExec(sql)
+    }
+
+    try {
+      await fs.writeFile(page, failedContent)
+      await vi.waitFor(() => expect(rejectNextInsert).toBe(false))
+      await vi.waitFor(async () => {
+        const after = await database.prepare(`SELECT * FROM ${collection.tableName} WHERE id = ?`)
+          .get('content/index.md')
+        expect(after).toEqual(before)
+      })
+      expect(logError).toHaveBeenCalledOnce()
+    }
+    finally {
+      database.exec = originalExec
+      logError.mockRestore()
+    }
+
+    let resolveUpdate: (() => void) | undefined
+    const updateReceived = new Promise<void>((resolve) => {
+      resolveUpdate = resolve
+    })
+    const stopListening = contentHooks.hook('hmr:content:update', ({ key }) => {
+      if (key === 'content/index.md') {
+        resolveUpdate?.()
+      }
+    })
+
+    await fs.writeFile(page, recoveredContent)
+    await Promise.race([
+      updateReceived,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for HMR recovery')), 5000)),
+    ])
+    stopListening()
+
+    const cacheEntry = await db.fetchDevelopmentCacheForKey('content/index.md')
+    expect(cacheEntry?.checksum).toBe(getContentChecksum(recoveredContent))
+    expect(JSON.parse(cacheEntry!.value).body.value[0][2]).toBe('Recovered update')
   })
 })
