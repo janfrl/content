@@ -6,6 +6,7 @@ import {
   addTypeTemplate,
   addImports,
   addServerImports,
+  addServerPlugin,
   addPlugin,
   hasNuxtModule,
   updateTemplates,
@@ -107,6 +108,7 @@ export default defineNuxtModule<ModuleOptions>({
   },
   async setup(options, nuxt) {
     const resolver = createResolver(import.meta.url)
+    addServerPlugin(resolver.resolve('./runtime/plugins/database.server'))
     const manifest: Manifest = {
       checksumStructure: {},
       checksum: {},
@@ -310,8 +312,6 @@ async function processCollectionItems(nuxt: Nuxt, collections: ResolvedCollectio
   // This will allow to correctly generate production imports
   const usedComponents: Array<string> = []
 
-  // Remove all existing content collections to start with a clean state
-  db.dropContentTables()
   // Create database dump
   for await (const collection of collections) {
     if (collection.name === 'info') {
@@ -374,7 +374,7 @@ async function processCollectionItems(nuxt: Nuxt, collections: ResolvedCollectio
                 collectionType: collection.type,
               })
               if (parsedContent) {
-                db.insertDevelopmentCache(keyInCollection, JSON.stringify(parsedContent), checksum)
+                await db.insertDevelopmentCache(keyInCollection, checksum, JSON.stringify(parsedContent))
               }
             }
 
@@ -420,24 +420,25 @@ async function processCollectionItems(nuxt: Nuxt, collections: ResolvedCollectio
 
   const sqlDumpList = Object.values(collectionDump).flatMap(a => a)
 
-  // Drop info table and recreate it
-  db.exec(`DROP TABLE IF EXISTS ${infoCollection.tableName}`)
-  // Use transaction for faster execution (SQLite only)
+  // Keep the previous database readable while the replacement is prepared,
+  // then swap all content tables atomically (SQLite only).
   try {
     if (db.supportsTransactions) {
-      db.exec('BEGIN TRANSACTION')
+      await db.exec('BEGIN TRANSACTION')
     }
+    await db.dropContentTables()
+    await db.exec(`DROP TABLE IF EXISTS ${infoCollection.tableName}`)
     for (const sql of sqlDumpList) {
-      db.exec(sql)
+      await db.exec(sql)
     }
     if (db.supportsTransactions) {
-      db.exec('COMMIT')
+      await db.exec('COMMIT')
     }
   }
   catch (error) {
     if (db.supportsTransactions) {
       try {
-        db.exec('ROLLBACK')
+        await db.exec('ROLLBACK')
       }
       catch {
         // Ignore rollback errors, original error takes precedence

@@ -17,11 +17,11 @@ export type DatabaseAdapterFactory<Options> = (otps?: Options) => DatabaseAdapte
 export interface LocalDevelopmentDatabase {
   fetchDevelopmentCache(): Promise<Record<string, CacheEntry>>
   fetchDevelopmentCacheForKey(key: string): Promise<CacheEntry | undefined>
-  insertDevelopmentCache(id: string, checksum: string, parsedContent: string): void
-  deleteDevelopmentCache(id: string): void
-  dropContentTables(): void
-  exec(sql: string): void
-  close(): void
+  insertDevelopmentCache(id: string, checksum: string, parsedContent: string): Promise<void>
+  deleteDevelopmentCache(id: string): Promise<void>
+  dropContentTables(): Promise<void>
+  exec(sql: string): Promise<void>
+  close(): Promise<void>
   database?: Connector
   /**
    * Whether the database supports BEGIN/COMMIT SQL statements.

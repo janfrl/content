@@ -9,7 +9,7 @@ import { tables, checksums, checksumsStructure } from '#content/manifest'
 import adapter from '#content/adapter'
 import localAdapter from '#content/local-adapter'
 
-let db: Connector
+let db: Connector | undefined
 export default function loadDatabaseAdapter(config: RuntimeConfig['content']) {
   const { database, localDatabase } = config
 
@@ -22,19 +22,28 @@ export default function loadDatabaseAdapter(config: RuntimeConfig['content']) {
     }
   }
 
+  const connector = db!
   return <DatabaseAdapter>{
     all: async (sql, params = []) => {
-      return db.prepare(sql).all(...params)
+      return connector.prepare(sql).all(...params)
         .then(result => (result || []).map((item: unknown) => refineContentFields(sql, item)))
     },
     first: async (sql, params = []) => {
-      return db.prepare(sql).get(...params)
+      return connector.prepare(sql).get(...params)
         .then(item => item ? refineContentFields(sql, item) : item)
     },
     exec: async (sql, params = []) => {
-      return db.prepare(sql).run(...params)
+      return connector.prepare(sql).run(...params)
     },
   }
+}
+
+export async function disposeDatabaseAdapter() {
+  const database = db
+  db = undefined
+  checkDatabaseIntegrity.clear()
+  integrityCheckPromise.clear()
+  await database?.dispose?.()
 }
 
 const checkDatabaseIntegrity = new Map<string, boolean>()

@@ -66,10 +66,15 @@ async function getDatabase(database: SqliteDatabaseConfig | D1DatabaseConfig, op
     })
 }
 
-const _localDatabase: Record<string, Connector> = {}
-export async function getLocalDatabase(database: SqliteDatabaseConfig | D1DatabaseConfig, { connector, sqliteConnector }: { connector?: Connector, nativeSqlite?: boolean, sqliteConnector?: SQLiteConnector } = {}): Promise<LocalDevelopmentDatabase> {
+interface LocalDatabaseEntry {
+  connector: Promise<Connector>
+  close?: Promise<void>
+}
+
+const _localDatabase: Record<string, LocalDatabaseEntry> = {}
+export async function getLocalDatabase(database: SqliteDatabaseConfig | D1DatabaseConfig, { connector, nativeSqlite, sqliteConnector }: { connector?: Connector, nativeSqlite?: boolean, sqliteConnector?: SQLiteConnector } = {}): Promise<LocalDevelopmentDatabase> {
   const databaseLocation = database.type === 'sqlite' ? database.filename : database.bindingName
-  const db = _localDatabase[databaseLocation] || connector || await getDatabase(database, { sqliteConnector })
+  const requestedConnector = sqliteConnector || (nativeSqlite ? 'native' : undefined)
   const cacheCollection = {
     tableName: '_development_cache',
     extendedSchema: {
@@ -94,28 +99,51 @@ export async function getLocalDatabase(database: SqliteDatabaseConfig | D1Databa
     },
   } as unknown as ResolvedCollection
 
-  // If the database is already initialized, we need to drop the cache table
-  if (!_localDatabase[databaseLocation]) {
-    _localDatabase[databaseLocation] = db
+  let databaseEntry = _localDatabase[databaseLocation]
+  if (!databaseEntry) {
+    const databasePromise = (async () => {
+      const db = connector || await getDatabase(database, { sqliteConnector: requestedConnector })
+      try {
+        if (database.type === 'sqlite') {
+          // The dev server reads and updates the same database from separate
+          // connections. WAL allows those reads to continue while HMR commits a
+          // content update, while the timeout absorbs short writer contention.
+          await db.exec('PRAGMA journal_mode = WAL')
+          await db.exec('PRAGMA busy_timeout = 5000')
+        }
 
-    let dropCacheTable
-    try {
-      dropCacheTable = await db.prepare('SELECT * FROM _development_cache WHERE id = ?')
-        .get('__DATABASE_VERSION__').then(row => (row as unknown as { value: string })?.value !== databaseVersion)
-    }
-    catch {
-      dropCacheTable = true
-    }
+        let dropCacheTable
+        try {
+          dropCacheTable = await db.prepare('SELECT * FROM _development_cache WHERE id = ?')
+            .get('__DATABASE_VERSION__').then(row => (row as unknown as { value: string })?.value !== databaseVersion)
+        }
+        catch {
+          dropCacheTable = true
+        }
 
-    const initQueries = generateCollectionTableDefinition(cacheCollection, { drop: Boolean(dropCacheTable) })
-    for (const query of initQueries.split('\n')) {
-      await db.exec(query)
-    }
-    // Initialize the database version
-    if (dropCacheTable) {
-      await db.exec(generateCollectionInsert(cacheCollection, { id: '__DATABASE_VERSION__', value: databaseVersion, checksum: databaseVersion }).queries[0]!)
-    }
+        const initQueries = generateCollectionTableDefinition(cacheCollection, { drop: Boolean(dropCacheTable) })
+        for (const query of initQueries.split('\n')) {
+          await db.exec(query)
+        }
+        if (dropCacheTable) {
+          await db.exec(generateCollectionInsert(cacheCollection, { id: '__DATABASE_VERSION__', value: databaseVersion, checksum: databaseVersion }).queries[0]!)
+        }
+        return db
+      }
+      catch (error) {
+        await db.dispose?.()
+        throw error
+      }
+    })()
+    databaseEntry = { connector: databasePromise }
+    _localDatabase[databaseLocation] = databaseEntry
+    databasePromise.catch(() => {
+      if (_localDatabase[databaseLocation] === databaseEntry) {
+        Reflect.deleteProperty(_localDatabase, databaseLocation)
+      }
+    })
   }
+  const db = await databaseEntry.connector
 
   const fetchDevelopmentCache = async () => {
     const result = await db.prepare('SELECT * FROM _development_cache').all() as CacheEntry[]
@@ -126,33 +154,39 @@ export async function getLocalDatabase(database: SqliteDatabaseConfig | D1Databa
     return await db.prepare('SELECT * FROM _development_cache WHERE id = ?').get(id) as CacheEntry | undefined
   }
 
-  const insertDevelopmentCache = async (id: string, value: string, checksum: string) => {
-    deleteDevelopmentCache(id)
-    const insert = generateCollectionInsert(cacheCollection, { id, value, checksum })
+  const insertDevelopmentCache = async (id: string, checksum: string, parsedContent: string) => {
+    await deleteDevelopmentCache(id)
+    const insert = generateCollectionInsert(cacheCollection, { id, value: parsedContent, checksum })
     for (const query of insert.queries) {
       await db.exec(query)
     }
   }
 
   const deleteDevelopmentCache = async (id: string) => {
-    db.prepare(`DELETE FROM _development_cache WHERE id = ?`).run(id)
+    await db.prepare(`DELETE FROM _development_cache WHERE id = ?`).run(id)
   }
 
   const dropContentTables = async () => {
     const tables = await db.prepare('SELECT name FROM sqlite_master WHERE type = ? AND name LIKE ?')
       .all('table', '_content_%') as { name: string }[]
     for (const { name } of tables) {
-      db.exec(`DROP TABLE ${name}`)
+      await db.exec(`DROP TABLE ${name}`)
     }
   }
 
   return {
     database: db,
     async exec(sql: string) {
-      db.exec(sql)
+      await db.exec(sql)
     },
-    close() {
-      Reflect.deleteProperty(_localDatabase, databaseLocation)
+    async close() {
+      if (!databaseEntry.close) {
+        databaseEntry.close = Promise.resolve(db.dispose?.())
+      }
+      if (_localDatabase[databaseLocation] === databaseEntry) {
+        Reflect.deleteProperty(_localDatabase, databaseLocation)
+      }
+      await databaseEntry.close
     },
     fetchDevelopmentCache,
     fetchDevelopmentCacheForKey,
