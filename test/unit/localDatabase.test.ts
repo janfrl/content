@@ -1,6 +1,11 @@
+import fs from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Connector, Primitive, Statement } from 'db0'
 import { describe, expect, test, vi } from 'vitest'
 import { databaseVersion, getLocalDatabase } from '../../src/utils/database'
+import { isNodeSqliteAvailable } from '../../src/utils/dependencies'
+import type { SQLiteConnector } from '../../src/types/module'
 
 function deferred() {
   let resolve: () => void
@@ -116,29 +121,22 @@ describe('local development database', () => {
     await db.close()
   })
 
-  test('deletes a cache entry before inserting its replacement', async () => {
-    const deletion = deferred()
-    const calls: string[] = []
+  test('atomically replaces an existing cache entry', async () => {
+    const calls: Array<{ sql: string, params: Primitive[] }> = []
     const connector = createConnector({
-      exec: (sql) => {
-        calls.push(sql)
-      },
-      run: async (sql) => {
-        calls.push(sql)
-        await deletion.promise
+      run: async (sql, params) => {
+        calls.push({ sql, params })
         return { success: true }
       },
     })
     const db = await createDatabase(connector)
     calls.length = 0
 
-    const operation = db.insertDevelopmentCache('content/page.md', 'checksum', '{"title":"Page"}')
-    await Promise.resolve()
-    expect(calls).toEqual(['DELETE FROM _development_cache WHERE id = ?'])
+    await db.insertDevelopmentCache('content/page.md', 'checksum', '{"title":"Page"}')
 
-    deletion.resolve()
-    await operation
-    expect(calls[1]).toContain(`'content/page.md', 'checksum', '{"title":"Page"}'`)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sql).toContain('ON CONFLICT(id) DO UPDATE SET')
+    expect(calls[0]!.params).toEqual(['content/page.md', '{"title":"Page"}', 'checksum'])
     await db.close()
   })
 
@@ -194,5 +192,39 @@ describe('local development database', () => {
     disposal.resolve()
     await operations
     expect(settled).toBe(true)
+  })
+})
+
+const sqliteConnectors: SQLiteConnector[] = ['better-sqlite3', 'sqlite3']
+if (isNodeSqliteAvailable()) {
+  sqliteConnectors.push('native')
+}
+
+describe.each(sqliteConnectors)('local development database with the %s connector', (sqliteConnector) => {
+  test('initializes and atomically replaces cache entries', async () => {
+    const filename = join(tmpdir(), `nuxt-content-${sqliteConnector}-${Date.now()}.sqlite`)
+    const db = await getLocalDatabase(
+      { type: 'sqlite', filename },
+      { sqliteConnector },
+    )
+
+    try {
+      await db.insertDevelopmentCache('content/page.md', 'first', '{"title":"First"}')
+      await db.insertDevelopmentCache('content/page.md', 'second', '{"title":"Second"}')
+
+      expect(await db.fetchDevelopmentCacheForKey('content/page.md')).toMatchObject({
+        id: 'content/page.md',
+        value: '{"title":"Second"}',
+        checksum: 'second',
+      })
+    }
+    finally {
+      await db.close()
+      await Promise.all([
+        fs.rm(filename, { force: true }),
+        fs.rm(`${filename}-shm`, { force: true }),
+        fs.rm(`${filename}-wal`, { force: true }),
+      ])
+    }
   })
 })

@@ -155,11 +155,12 @@ export async function getLocalDatabase(database: SqliteDatabaseConfig | D1Databa
   }
 
   const insertDevelopmentCache = async (id: string, checksum: string, parsedContent: string) => {
-    await deleteDevelopmentCache(id)
-    const insert = generateCollectionInsert(cacheCollection, { id, value: parsedContent, checksum })
-    for (const query of insert.queries) {
-      await db.exec(query)
-    }
+    await db.prepare(`INSERT INTO _development_cache (id, value, checksum)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        value = excluded.value,
+        checksum = excluded.checksum`)
+      .run(id, parsedContent, checksum)
   }
 
   const deleteDevelopmentCache = async (id: string) => {
