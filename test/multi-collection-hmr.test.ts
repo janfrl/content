@@ -6,7 +6,7 @@ import { defineCollection } from '../src/utils'
 import { generateCollectionTableDefinition, resolveCollection } from '../src/utils/collection'
 import { contentHooks, getContentChecksum, logger, watchContents } from '../src/utils/dev'
 import { getLocalDatabase } from '../src/utils/database'
-import { initiateValidatorsContext } from '../src/utils/dependencies'
+import { initiateValidatorsContext, isNodeSqliteAvailable } from '../src/utils/dependencies'
 import type { LocalDevelopmentDatabase } from '../src/module'
 import type { Manifest } from '../src/types/manifest'
 
@@ -218,4 +218,45 @@ describe('multi-collection HMR — file matched by multiple collections', () => 
     expect(cacheEntry?.checksum).toBe(getContentChecksum(recoveredContent))
     expect(JSON.parse(cacheEntry!.value).body.value[0][2]).toBe('Recovered update')
   })
+
+  test.runIf(isNodeSqliteAvailable())('updates content while another connection holds a read transaction', async () => {
+    const { DatabaseSync } = await import('node:sqlite')
+    const reader = new DatabaseSync(dbPath)
+    const collection = manifest.collections.find(item => item.name === 'content')!
+    const page = join(contentDir, 'reader-lock.md')
+    const updatedContent = '---\ntitle: Reader lock\n---\n# Added alongside a reader\n'
+    const journalMode = reader.prepare('PRAGMA journal_mode').get()
+    let stopListening: (() => void) | undefined
+
+    try {
+      reader.exec('BEGIN')
+      reader.prepare(`SELECT * FROM ${collection.tableName}`).all()
+
+      let resolveUpdate: (() => void) | undefined
+      const updateReceived = new Promise<void>((resolve) => {
+        resolveUpdate = resolve
+      })
+      stopListening = contentHooks.hook('hmr:content:update', ({ key }) => {
+        if (key === 'content/reader-lock.md') {
+          resolveUpdate?.()
+        }
+      })
+
+      await fs.writeFile(page, updatedContent)
+      await Promise.race([
+        updateReceived,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out while a second connection held a read transaction')), 5000)),
+      ])
+    }
+    finally {
+      stopListening?.()
+      reader.exec('ROLLBACK')
+      reader.close()
+    }
+
+    const cacheEntry = await db.fetchDevelopmentCacheForKey('content/reader-lock.md')
+    expect(journalMode).toEqual({ journal_mode: 'wal' })
+    expect(cacheEntry?.checksum).toBe(getContentChecksum(updatedContent))
+    expect(JSON.parse(cacheEntry!.value).body.value[0][2]).toBe('Added alongside a reader')
+  }, 10_000)
 })
